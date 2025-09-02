@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chess</title>
+
+    <link rel="preload" as="image" href="./assets/chess/king-w.svg" />
+    <link rel="preload" as="image" href="./assets/chess/queen-w.svg" />
+    <link rel="preload" as="image" href="./assets/chess/bishop-w.svg" />
+    <link rel="preload" as="image" href="./assets/chess/knight-w.svg" />
+    <link rel="preload" as="image" href="./assets/chess/rook-w.svg" />
+    <link rel="preload" as="image" href="./assets/chess/pawn-w.svg" />
+    <link rel="preload" as="image" href="./assets/chess/king-b.svg" />
+    <link rel="preload" as="image" href="./assets/chess/queen-b.svg" />
+    <link rel="preload" as="image" href="./assets/chess/bishop-b.svg" />
+    <link rel="preload" as="image" href="./assets/chess/knight-b.svg" />
+    <link rel="preload" as="image" href="./assets/chess/rook-b.svg" />
+    <link rel="preload" as="image" href="./assets/chess/pawn-b.svg" />
+
+    <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+    <div class="layout">
+        <main class="stage">
+            <div class="board-wrap">
+                <div id="board" class="board" aria-label="Chessboard"></div>
+            </div>
+        </main>
+
+        <aside class="sidebar">
+            <div id="turn" class="turn">Turn: White</div>
+
+            <div class="group">
+                <div class="group__title">Game</div>
+                <div class="row">
+                    <button id="reset" class="btn">Reset</button>
+                    <button id="flip" class="btn">Flip Board</button>
+                </div>
+            </div>
+
+            <div class="group">
+                <div class="group__title">FEN</div>
+                <textarea id="fenInput" rows="2" spellcheck="false" class="input"></textarea>
+                <div class="row">
+                    <button id="btnCopyFEN" class="btn">Copy FEN</button>
+                    <button id="btnLoadFEN" class="btn">Load FEN</button>
+                </div>
+            </div>
+
+            <div class="group">
+                <div class="group__title">Self-play</div>
+                <div class="row">
+                    <button id="selfplayStart" class="btn">Self-play</button>
+                    <button id="selfplayStop" class="btn btn--ghost">Stop</button>
+                    <label class="field">Delay (ms)
+                        <input id="selfplayDelay" type="number" value="300" min="0" class="input input--sm" />
+                    </label>
+                    <label class="field">Depth
+                        <input id="selfplayDepth" type="number" value="3" min="1" max="16" class="input input--sm" />
+                    </label>
+                    <label>
+                        Eval:
+                        <select id="selfPlayEvalMode">
+                            <option value="classic">classic</option>
+                            <option value="mlp">mlp</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+
+            <div class="group">
+                <div class="group__title">History</div>
+                <div class="history-shell">
+                    <ol id="history"></ol>
+                </div>
+            </div>
+
+            <div class="group">
+                <div class="group__title">Dataset</div>
+                <div class="row">
+                    <label class="field"><input id="logToggle" type="checkbox" checked /> Log</label>
+                    <button id="exportJSONL" class="btn">Export JSONL</button>
+                    <button id="clearDataset" class="btn btn--ghost">Clear</button>
+                </div>
+                <div class="row">
+                    <label class="field">Count
+                        <input id="batchCount" type="number" value="500" min="1" class="input input--sm" />
+                    </label>
+                    <label class="field">Depth
+                        <input id="batchDepth" type="number" value="4" min="1" max="8" class="input input--sm" />
+                    </label>
+                    <label>
+                        Eval:
+                        <select id="batchEvalMode">
+                            <option value="classic">classic</option>
+                            <option value="mlp">mlp</option>
+                        </select>
+                    </label>
+                    <label>
+                        per-pos (ms):
+                        <input id="batchPerPos" type="number" min="10" step="10" value="200">
+                    </label>
+                    <label>
+                        plies min:
+                        <input id="batchPliesMin" type="number" min="0" max="120" value="16">
+                    </label>
+                    <label>
+                        plies max:
+                        <input id="batchPliesMax" type="number" min="0" max="120" value="80">
+                    </label>
+                    <button id="batchStart" class="btn">Batch Label</button>
+                    <button id="batchStop" class="btn btn--ghost">Stop</button>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <script type="module" src="./src/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,200 @@
+:root{
+    --bg: #0f172a;           /* page bg */
+    --panel: #ffffff;        /* sidebar bg */
+    --text: #0b1220;
+    --muted: #708090;
+    --brand: #2563eb;
+    --border: #e5e7eb;
+
+    --light: #d9f2ea;
+    --dark:  #2a7a67;
+    --selected: #facc15;
+    --target:   #93c5fd;
+    --incheck:  #ef4444;
+
+    --grid: rgba(0,0,0,.18);
+
+    /* sprite config */
+    --chess-sprite: url("./assets/chess/pieces-sheet.png");
+    --cols: 6; /* K Q B N R P */
+    --rows: 2; /* white row 0, black row 1 */
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body{
+    margin:0;
+    color:var(--text);
+    background:var(--bg);
+    font: 14px/1.25 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+
+/* ---------- Page layout ---------- */
+.layout{
+    display:grid;
+    grid-template-columns: 1fr 320px;
+    gap:16px;
+    min-height:100vh;
+    padding:16px;
+}
+
+.stage{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:8px;
+}
+
+.board-wrap{
+    width:min(88vmin, 760px);
+    aspect-ratio: 1 / 1;
+    border-radius: 14px;
+    overflow:hidden;
+    box-shadow: 0 10px 30px rgba(0,0,0,.25);
+    background: #0b3a32;
+    padding:6px;
+}
+
+/* ---------- Board ---------- */
+.board{
+    width:100%;
+    height:100%;
+    display:grid;
+    grid-template-columns: repeat(8, 1fr);
+    grid-auto-rows: 1fr;
+    border:2px solid #0a332c;
+    border-radius:10px;
+    overflow:hidden;
+}
+
+.square{
+    display:grid;
+    place-items:center;
+    border:1px solid var(--grid);
+    background:#fff; /* overwritten by .light/.dark */
+    padding:0;
+    cursor:pointer;
+    user-select:none;
+    outline:none;
+    position:relative;
+}
+.square.light{ background: var(--light); }
+.square.dark { background: var(--dark); }
+
+.square:hover{ filter:brightness(1.06); }
+.square.selected { box-shadow: inset 0 0 0 3px var(--selected); }
+.square.target   { box-shadow: inset 0 0 0 3px var(--target); }
+.square.in-check { box-shadow: inset 0 0 0 3px var(--incheck); }
+
+/* ---------- Pieces (individual SVG files) ---------- */
+.piece{
+    display: grid;
+    place-items: center;
+    width: 100%;
+    height: 100%;
+}
+.piece-svg{
+    width: 78%;            /* tweak 72–86% to taste */
+    max-height: 86%;
+    height: auto;
+    pointer-events: none;  /* clicks go to square */
+    user-select: none;
+    -webkit-user-drag: none;
+    image-rendering: auto; /* SVG anti-aliased */
+    filter: drop-shadow(0 0.5px 1px rgba(0,0,0,.28));
+}
+
+/* Move hint dot */
+.hint-dot{
+    width: 24%;
+    height: 24%;
+    border-radius: 999px;
+    background: rgba(0,0,0,.25);
+    box-shadow: inset 0 0 0 2px rgba(255,255,255,.35);
+    position:absolute;
+}
+
+/* ---------- Sidebar ---------- */
+.sidebar{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:14px;
+    display:flex;
+    flex-direction:column;
+    gap:12px;
+    min-height: 0; /* for flex overflow */
+}
+
+.turn{ font-weight:700; font-size:16px; }
+
+.group{ display:flex; flex-direction:column; gap:8px; }
+.group__title{
+    font-weight:600;
+    color:var(--muted);
+    letter-spacing:.02em;
+}
+
+.row{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    flex-wrap:wrap;
+}
+
+/* Inline label + input */
+.field{ display:flex; align-items:center; gap:6px; white-space:nowrap; }
+
+/* Controls */
+.btn{
+    appearance:none;
+    border:1px solid var(--border);
+    background:#fff;
+    color:var(--text);
+    padding:8px 10px;
+    border-radius:8px;
+    cursor:pointer;
+    transition: transform .03s ease, background .15s ease;
+}
+.btn:hover{ background:#f3f4f6; }
+.btn:active{ transform: translateY(1px); }
+.btn--ghost{ background:transparent; }
+
+.input{
+    width:100%;
+    padding:8px 10px;
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:#fff;
+}
+.input--sm{ width:88px; padding:6px 8px; }
+
+/* FEN textarea */
+#fenInput{ width:100%; min-height:58px; resize: vertical; }
+
+/* History area: scrollable, fixed height */
+.history-shell{
+  height: 16vh;           /* fixed, so the sidebar won’t grow */
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  background: #fafafa;
+}
+
+/* allow flex children to shrink & scroll inside groups on some browsers */
+.group{ 
+  display:flex; 
+  flex-direction:column; 
+  gap:8px; 
+  min-height: 0;          /* NEW */
+}
+#history{ margin:0; padding-left:18px; }
+
+/* ---------- Responsive ---------- */
+@media (max-width: 980px){
+    .layout{ grid-template-columns: 1fr; }
+    .stage{ order:0; }
+    .sidebar{ order:1; }
+    .board-wrap{ width:min(96vmin, 680px); }
+}
