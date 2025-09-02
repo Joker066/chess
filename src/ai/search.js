@@ -1,9 +1,9 @@
-// src/ai/search.js — clean, fast, depth-finish friendly (4-space indent, newline-before else/catch)
-// Adds: root time-guard, light ordering, LMR tune, Null-Move Pruning, Futility Pruning,
-// Late-Move Pruning, and guarantees finite scores for logging.
+// src/ai/search.js — consolidated + style‑clean pass (4‑space indent, newline‑before else/catch)
+// Includes: endgame‑aware pruning, repetition with contempt, 50‑move & insuff. material draws,
+// known‑king "gives check" optimization, stronger shallow LMP/futility, root guard & chunking.
 
 import { fromIndex, toIndex } from "../board.js";
-import { allLegalMoves, inCheck } from "../moves.js";
+import { allLegalMoves, inCheck, findKing, isSquareAttacked } from "../moves.js";
 import { cloneState, applyMovePure } from "./pure.js";
 import { computeKey } from "./zobrist.js";
 import { ttProbe, ttStore, TT_FLAG } from "./tt.js";
@@ -16,7 +16,7 @@ import { toFEN } from "../fen.js";
 let DEADLINE = Number.POSITIVE_INFINITY;
 function timeExpired() { return Date.now() >= DEADLINE; }
 
-const YIELD_MS = 30; // coarser to reduce scheduler overhead
+const YIELD_MS = 30;
 let _lastYield = (typeof performance !== "undefined" ? performance.now() : Date.now());
 async function maybeYield() {
     const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
@@ -32,15 +32,18 @@ async function maybeYield() {
 const MAX_PLY = 128;
 const killers = Array.from({ length: MAX_PLY }, () => new Int32Array([ -1, -1 ]));
 const history = [
-    Array.from({ length: 64 }, () => new Int32Array(64)), // white
-    Array.from({ length: 64 }, () => new Int32Array(64)), // black
+    Array.from({ length: 64 }, () => new Int32Array(64)),
+    Array.from({ length: 64 }, () => new Int32Array(64))
 ];
 
 function moveKey(from, to) { return (from << 6) | to; }
 function addKiller(ply, mkey) {
     if (ply < 0 || ply >= MAX_PLY) return;
     const ks = killers[ply];
-    if (ks[0] !== mkey) { ks[1] = ks[0]; ks[0] = mkey; }
+    if (ks[0] !== mkey) {
+        ks[1] = ks[0];
+        ks[0] = mkey;
+    }
 }
 function bumpHistory(sideIdx, from, to, depth) {
     const bonus = (depth + 1) * (depth + 1) * 32;
@@ -51,9 +54,41 @@ function bumpHistory(sideIdx, from, to, depth) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Move helpers (cheap)
+// Phase / material helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function nonPawnPieceCount(state) {
+    let n = 0;
+    for (let i = 0; i < 64; i++) {
+        const p = state.board[i];
+        if (!p) continue;
+        const t = (p.t || "").toUpperCase();
+        if (t !== "P" && t !== "K") n++;
+    }
+    return n;
+}
+function endgamePhase(state) { return nonPawnPieceCount(state) <= 4; }
+
+function insufficientMaterial(state) {
+    let pawns = 0, heavy = 0, minors = 0;
+    for (let i = 0; i < 64; i++) {
+        const p = state.board[i];
+        if (!p) continue;
+        const t = (p.t || "").toUpperCase();
+        if (t === "P") pawns++;
+        else if (t === "R" || t === "Q") heavy++;
+        else if (t === "B" || t === "N") minors++;
+    }
+    if (pawns > 0) return false;
+    if (heavy > 0) return false;
+    return minors <= 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scoring helpers
 // ─────────────────────────────────────────────────────────────────────────────
 const VAL = { P:100, N:320, B:330, R:500, Q:900, K:0 };
+const CONTEMPT = 12; // cp
+function drawScore(turn) { return (turn === "w") ? -CONTEMPT : CONTEMPT; }
 
 function isEnPassantMove(state, from, to) {
     const mover = state.board[from];
@@ -91,21 +126,40 @@ function isQuietMove(state, from, to) {
     return !isCapture(state, from, to) && !isPromotionMove(state, from, to) && !isCastleMove(state, from, to);
 }
 
-function isCheckAfter(state, from, to) {
-    const cs = cloneState(state);
-    const before = cs.turn;
-    applyMovePure(cs, from, to);
-    if (cs.turn === before && typeof console !== "undefined") {
-        console.warn("applyMovePure did not flip turn in isCheckAfter");
+// Cheap gives-check using do/undo + known enemy king
+function givesCheckAfter(state, from, to, enemyKingSq) {
+    const mover = state.board[from];
+    if (!mover) return false;
+    const fromRF = fromIndex(from), toRF = fromIndex(to);
+    const dir = mover.c === "w" ? -1 : 1;
+    const savedFrom = mover;
+    const savedTo = state.board[to];
+    let epCapIdx = -1;
+    let epCapSaved = null;
+    const isEP = (mover.t === "P" && to === state.ep && fromRF.f !== toRF.f && !savedTo);
+    if (isEP) {
+        epCapIdx = toIndex(toRF.r - dir, toRF.f);
+        epCapSaved = state.board[epCapIdx];
     }
-    return inCheck(cs, cs.turn);
+    if (epCapIdx !== -1) state.board[epCapIdx] = null;
+    state.board[to] = savedFrom;
+    state.board[from] = null;
+    const attackersColor = mover.c;
+    const check = isSquareAttacked(state, enemyKingSq, attackersColor);
+    state.board[from] = savedFrom;
+    state.board[to] = savedTo;
+    if (epCapIdx !== -1) state.board[epCapIdx] = epCapSaved;
+    return check;
 }
 
-// Annotate moves once per node. `light` skips expensive checks.
 function annotateMoves(state, moves, ttBest, sideIdx, ply, { light=false } = {}) {
     const k0 = killers[ply]?.[0] ?? -1;
     const k1 = killers[ply]?.[1] ?? -1;
     const out = [];
+
+    const moverColor = state.turn;
+    const enemyColor = (moverColor === "w" ? "b" : "w");
+    const enemyKingSq = findKing(state, enemyColor);
 
     for (const [from, to] of moves) {
         const mover  = state.board[from];
@@ -113,34 +167,36 @@ function annotateMoves(state, moves, ttBest, sideIdx, ply, { light=false } = {})
         const mv = VAL[(mover?.t || "").toUpperCase()]  || 0;
         const epCap = isEnPassantMove(state, from, to);
         const vv = epCap ? VAL.P : (VAL[(target?.t || "").toUpperCase()] || 0);
-
         let os = 0;
-
-        // Captures: MVV-LVA-ish
         const isCap = !!(target || epCap);
-        if (isCap) os += 10 * vv - mv;
-
-        const quiet = !isCap && !isPromotionMove(state, from, to) && !isCastleMove(state, from, to);
-
-        if (!light) {
-            if (quiet && isCheckAfter(state, from, to)) os += 150;
+        if (isCap) {
+            os += 10 * vv - mv;
         }
-
+        const quiet = !isCap && !isPromotionMove(state, from, to) && !isCastleMove(state, from, to);
+        if (!light) {
+            if (quiet && enemyKingSq !== -1 && givesCheckAfter(state, from, to, enemyKingSq)) {
+                os += 150;
+            }
+        }
         if (quiet) {
             const r = Math.floor(to / 8), f = to % 8;
             const dist = Math.abs(r - 3.5) + Math.abs(f - 3.5);
             os += (8 - dist) | 0;
         }
-
-        if (ttBest && from === ttBest[0] && to === ttBest[1]) os += 1e9;
-
+        if (ttBest && from === ttBest[0] && to === ttBest[1]) {
+            os += 1e9;
+        }
         const mkey = moveKey(from, to);
         if (quiet) {
-            if (mkey === k0) os += 5e8;
-            else if (mkey === k1) os += 5e8 - 1;
+            if (mkey === k0) {
+                os += 5e8;
+            }
+            else
+            if (mkey === k1) {
+                os += 5e8 - 1;
+            }
             os += (history[sideIdx][from][to] | 0);
         }
-
         out.push({ from, to, os, mkey, quiet });
     }
 
@@ -149,9 +205,30 @@ function annotateMoves(state, moves, ttBest, sideIdx, ply, { light=false } = {})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Draw/terminal helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function fiftyMoveDraw(state) {
+    const hm = state.halfmove ?? state.halfmoveClock ?? state.hm;
+    return (hm != null && hm >= 100);
+}
+
+const MATE = 100000;
+
+function terminalScoreGivenMoves(state, moves, depth) {
+    if (moves.length > 0) return null;
+    if (inCheck(state, state.turn)) {
+        const plyPenalty = (100 - depth);
+        return (state.turn === "w" ? -1 : 1) * (MATE - plyPenalty);
+    }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Quiescence — captures-only unless in check; ALWAYS finite
 // ─────────────────────────────────────────────────────────────────────────────
 async function quiescence(state, alpha, beta, evalFn) {
+    if (fiftyMoveDraw(state) || insufficientMaterial(state)) return drawScore(state.turn);
+
     const sideMax = (state.turn === "w");
     const inChk = inCheck(state, state.turn);
 
@@ -166,7 +243,7 @@ async function quiescence(state, alpha, beta, evalFn) {
             if (stand < beta) beta = stand;
         }
     }
-    if (timeExpired()) return stand; // finite fallback
+    if (timeExpired()) return stand;
 
     let moves = allLegalMoves(state, state.turn);
     if (!inChk) {
@@ -229,56 +306,75 @@ function makeNullMove(state) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main search with TT + killers + history + LMR + NMP + Futility + LMP
+// AlphaBeta with TT + killers + history + LMR + NMP + Futility + LMP + Repetition
 // ─────────────────────────────────────────────────────────────────────────────
-const MATE = 100000;
+export async function alphaBeta(state, depth, alpha, beta, evalFn, ply = 0, rep = null) {
+    if (fiftyMoveDraw(state) || insufficientMaterial(state)) return drawScore(state.turn);
 
-function terminalScoreGivenMoves(state, moves, depth) {
-    if (moves.length > 0) return null;
-    if (inCheck(state, state.turn)) {
-        const plyPenalty = (100 - depth);
-        return (state.turn === "w" ? -1 : 1) * (MATE - plyPenalty);
+    if (!rep) rep = new Map();
+
+    const key = computeKey(state);
+    const seen = rep.get(key) | 0;
+    if (seen >= 2) return drawScore(state.turn);
+    rep.set(key, seen + 1);
+
+    const endgame = endgamePhase(state);
+
+    if (timeExpired()) {
+        rep.set(key, seen);
+        return await quiescence(state, alpha, beta, evalFn);
     }
-    return 0; // stalemate
-}
-
-export async function alphaBeta(state, depth, alpha, beta, evalFn, ply = 0) {
-    if (timeExpired()) return await quiescence(state, alpha, beta, evalFn);
-    if (depth === 0)    return await quiescence(state, alpha, beta, evalFn);
+    if (depth === 0) {
+        rep.set(key, seen);
+        return await quiescence(state, alpha, beta, evalFn);
+    }
 
     const maximizing = (state.turn === "w");
-    const key = computeKey(state);
     const alphaStart = alpha, betaStart = beta;
 
     const moves0 = allLegalMoves(state, state.turn);
     const term = terminalScoreGivenMoves(state, moves0, depth);
-    if (term !== null) return term;
+    if (term !== null) {
+        rep.set(key, seen);
+        return term;
+    }
 
-    // Null-Move Pruning (skip in check / zugzwang-ish endgames)
-    if (depth >= 3 && !inCheck(state, state.turn) && hasNonPawnMaterial(state, state.turn)) {
+    if (!endgame && depth >= 3 && !inCheck(state, state.turn) && hasNonPawnMaterial(state, state.turn)) {
         const stand0 = evalFn(state);
         if (stand0 >= beta) {
             const R = (depth >= 6 ? 3 : 2);
             const ns = makeNullMove(state);
-            const nullScore = await alphaBeta(ns, depth - 1 - R, beta - 1, beta, evalFn, ply + 1);
-            if (nullScore >= beta) return nullScore; // fail-high cutoff
+            const nullScore = await alphaBeta(ns, depth - 1 - R, beta - 1, beta, evalFn, ply + 1, rep);
+            if (nullScore >= beta) {
+                rep.set(key, seen);
+                return nullScore;
+            }
         }
     }
 
-    // TT probe
     const entry = ttProbe(key, depth);
     if (entry) {
-        if (entry.flag === TT_FLAG.EXACT) return entry.score;
-        if (entry.flag === TT_FLAG.LOWER) alpha = Math.max(alpha, entry.score);
-        else if (entry.flag === TT_FLAG.UPPER) beta = Math.min(beta, entry.score);
-        if (alpha >= beta) return entry.score;
+        if (entry.flag === TT_FLAG.EXACT) {
+            rep.set(key, seen);
+            return entry.score;
+        }
+        if (entry.flag === TT_FLAG.LOWER) {
+            alpha = Math.max(alpha, entry.score);
+        }
+        else
+        if (entry.flag === TT_FLAG.UPPER) {
+            beta = Math.min(beta, entry.score);
+        }
+        if (alpha >= beta) {
+            rep.set(key, seen);
+            return entry.score;
+        }
     }
 
     const sideIdx = (state.turn === "w") ? 0 : 1;
     const ttBest = entry?.bestMove || null;
     const scored = annotateMoves(state, moves0, ttBest, sideIdx, ply, { light: depth <= 3 });
 
-    // Precompute stand for Futility when needed (lazy)
     let stand = null; const getStand = () => (stand ??= evalFn(state));
 
     if (maximizing) {
@@ -288,12 +384,10 @@ export async function alphaBeta(state, depth, alpha, beta, evalFn, ply = 0) {
             if (timeExpired()) break;
             const m = scored[idx];
 
-            // Late-Move Pruning: skip many late quiets at shallow depth
-            if (depth <= 2 && m.quiet && idx >= 12) continue;
+            if (!endgame && depth <= 3 && m.quiet && idx >= 8) continue;
 
-            // Futility pruning at depth==1: quiets that cannot raise alpha
-            if (depth === 1 && m.quiet && !inCheck(state, state.turn)) {
-                const margin = 200;
+            if (!endgame && depth === 1 && m.quiet && !inCheck(state, state.turn)) {
+                const margin = 250;
                 if (getStand() + margin <= alpha) continue;
             }
 
@@ -301,30 +395,33 @@ export async function alphaBeta(state, depth, alpha, beta, evalFn, ply = 0) {
             applyMovePure(cs, m.from, m.to);
 
             let val;
-            // LMR
-            if (depth >= 4 && m.quiet && idx >= 6 && ply < MAX_PLY - 1) {
+            if (!endgame && depth >= 4 && m.quiet && idx >= 6 && ply < MAX_PLY - 1) {
                 const R = (idx >= 10 ? 2 : 1);
-                val = await alphaBeta(cs, depth - 1 - R, alpha + 1, alpha + 1, evalFn, ply + 1);
+                val = await alphaBeta(cs, depth - 1 - R, alpha + 1, alpha + 1, evalFn, ply + 1, rep);
                 if (val > alpha && !timeExpired()) {
-                    val = await alphaBeta(cs, depth - 1, alpha, beta, evalFn, ply + 1);
+                    val = await alphaBeta(cs, depth - 1, alpha, beta, evalFn, ply + 1, rep);
                 }
             }
             else {
-                val = await alphaBeta(cs, depth - 1, alpha, beta, evalFn, ply + 1);
+                val = await alphaBeta(cs, depth - 1, alpha, beta, evalFn, ply + 1, rep);
             }
 
             if (val > best) best = val;
             if (val > alpha) alpha = val;
             if (alpha >= beta) {
-                if (m.quiet) { addKiller(ply, m.mkey); bumpHistory(sideIdx, m.from, m.to, depth); }
+                if (m.quiet) {
+                    addKiller(ply, m.mkey);
+                    bumpHistory(sideIdx, m.from, m.to, depth);
+                }
                 break;
             }
 
             await maybeYield();
         }
 
-        const flag = best <= alphaStart ? TT_FLAG.UPPER : best >= betaStart ? TT_FLAG.LOWER : TT_FLAG.EXACT;
+        const flag = (best <= alphaStart) ? TT_FLAG.UPPER : (best >= betaStart) ? TT_FLAG.LOWER : TT_FLAG.EXACT;
         ttStore(key, depth, flag, best, scored[0] ? [scored[0].from, scored[0].to] : null);
+        rep.set(key, seen);
         return best;
     }
     else {
@@ -334,40 +431,44 @@ export async function alphaBeta(state, depth, alpha, beta, evalFn, ply = 0) {
             if (timeExpired()) break;
             const m = scored[idx];
 
-            if (depth <= 2 && m.quiet && idx >= 12) continue; // LMP for minimizing
+            if (!endgame && depth <= 3 && m.quiet && idx >= 8) continue;
 
-            if (depth === 1 && m.quiet && !inCheck(state, state.turn)) {
-                const margin = 200;
-                if (getStand() - margin >= beta) continue; // symmetrical futility
+            if (!endgame && depth === 1 && m.quiet && !inCheck(state, state.turn)) {
+                const margin = 250;
+                if (getStand() - margin >= beta) continue;
             }
 
             const cs = cloneState(state);
             applyMovePure(cs, m.from, m.to);
 
             let val;
-            if (depth >= 4 && m.quiet && idx >= 6 && ply < MAX_PLY - 1) {
+            if (!endgame && depth >= 4 && m.quiet && idx >= 6 && ply < MAX_PLY - 1) {
                 const R = (idx >= 10 ? 2 : 1);
-                val = await alphaBeta(cs, depth - 1 - R, beta - 1, beta - 1, evalFn, ply + 1);
+                val = await alphaBeta(cs, depth - 1 - R, beta - 1, beta - 1, evalFn, ply + 1, rep);
                 if (val < beta && !timeExpired()) {
-                    val = await alphaBeta(cs, depth - 1, alpha, beta, evalFn, ply + 1);
+                    val = await alphaBeta(cs, depth - 1, alpha, beta, evalFn, ply + 1, rep);
                 }
             }
             else {
-                val = await alphaBeta(cs, depth - 1, alpha, beta, evalFn, ply + 1);
+                val = await alphaBeta(cs, depth - 1, alpha, beta, evalFn, ply + 1, rep);
             }
 
             if (val < best) best = val;
             if (val < beta) beta = val;
             if (alpha >= beta) {
-                if (m.quiet) { addKiller(ply, m.mkey); bumpHistory(sideIdx, m.from, m.to, depth); }
+                if (m.quiet) {
+                    addKiller(ply, m.mkey);
+                    bumpHistory(sideIdx, m.from, m.to, depth);
+                }
                 break;
             }
 
             await maybeYield();
         }
 
-        const flag = best <= alphaStart ? TT_FLAG.UPPER : best >= betaStart ? TT_FLAG.LOWER : TT_FLAG.EXACT;
+        const flag = (best <= alphaStart) ? TT_FLAG.UPPER : (best >= betaStart) ? TT_FLAG.LOWER : TT_FLAG.EXACT;
         ttStore(key, depth, flag, best, scored[0] ? [scored[0].from, scored[0].to] : null);
+        rep.set(key, seen);
         return best;
     }
 }
@@ -399,7 +500,6 @@ export async function pickMove(
         return null;
     }
 
-    // Book hint
     const zkey = computeKey(state).toString(16);
     let bookHint = null;
     try {
@@ -408,11 +508,9 @@ export async function pickMove(
     }
     catch {}
 
-    // Root TT hint
     const rootTT = ttProbe(computeKey(state), 0);
     const ttHint = rootTT?.bestMove;
 
-    // Root ordering (light)
     const sideIdx = (player === "w") ? 0 : 1;
     let annotated = annotateMoves(state, moves, ttHint || bookHint, sideIdx, 0, { light: true });
     moves = annotated.map(m => [m.from, m.to]);
@@ -422,11 +520,17 @@ export async function pickMove(
     let lastScore = 0;
     let finishedDepth = 0;
 
-    const ASP_WIDE = 200; // aspiration only for d>=4
-    const GUARD_MS = 80;  // larger guard to finish a depth cleanly
+    const ASP_WIDE = 200; // aspiration only at d ≥ 5
+    const GUARD_MS = 140; // finish guard
 
-    // reset killers near root
-    for (let p = 0; p < Math.min(MAX_PLY, maxDepth + 4); p++) { killers[p][0] = -1; killers[p][1] = -1; }
+    for (let p = 0; p < Math.min(MAX_PLY, maxDepth + 4); p++) {
+        killers[p][0] = -1;
+        killers[p][1] = -1;
+    }
+
+    const rootKey = computeKey(state);
+    const repBase = new Map();
+    repBase.set(rootKey, 1);
 
     for (let d = 1; d <= maxDepth; d++) {
         if (timeMs != null && timeExpired()) break;
@@ -435,28 +539,37 @@ export async function pickMove(
         let localBestScore = (player === "w") ? -MATE : MATE;
 
         let alphaWin = -Infinity, betaWin = Infinity;
-        if (d >= 4 && Number.isFinite(lastScore)) {
+        if (d >= 5 && Number.isFinite(lastScore)) {
             alphaWin = lastScore - ASP_WIDE;
             betaWin  = lastScore + ASP_WIDE;
         }
 
-        for (const [from, to] of moves) {
+        const ROOT_CHUNK = 10;
+        const limit = Math.min(moves.length, ROOT_CHUNK);
+        for (let i = 0; i < limit; i++) {
             if (timeMs != null && timeExpired()) break;
             if (timeMs != null && (DEADLINE - Date.now()) < GUARD_MS) break;
 
+            const [from, to] = moves[i];
             const cs = cloneState(state);
             applyMovePure(cs, from, to);
 
-            let score = await alphaBeta(cs, d - 1, alphaWin, betaWin, evalFn, 1);
+            let score = await alphaBeta(cs, d - 1, alphaWin, betaWin, evalFn, 1, repBase);
             if (timeMs != null && !timeExpired() && (score <= alphaWin || score >= betaWin)) {
-                score = await alphaBeta(cs, d - 1, -Infinity, Infinity, evalFn, 1);
+                score = await alphaBeta(cs, d - 1, -Infinity, Infinity, evalFn, 1, repBase);
             }
 
             if (player === "w") {
-                if (score > localBestScore) { localBestScore = score; localBestMove = [from, to]; }
+                if (score > localBestScore) {
+                    localBestScore = score;
+                    localBestMove = [from, to];
+                }
             }
             else {
-                if (score < localBestScore) { localBestScore = score; localBestMove = [from, to]; }
+                if (score < localBestScore) {
+                    localBestScore = score;
+                    localBestMove = [from, to];
+                }
             }
 
             await maybeYield();
@@ -470,19 +583,17 @@ export async function pickMove(
             lastScore = localBestScore;
             finishedDepth = d;
 
-            // PV move to front
             moves.sort(([af, at], [bf, bt]) =>
                 (af === bestMove[0] && at === bestMove[1]) ? -1 :
                 (bf === bestMove[0] && bt === bestMove[1]) ?  1 : 0
             );
 
-            if (Math.abs(bestScore) > 99000) break; // mate found
+            if (Math.abs(bestScore) > 99000) break;
         }
 
         await maybeYield();
     }
 
-    // UI-safe score
     let uiScore = bestScore;
     if (!Number.isFinite(uiScore)) {
         const q = await quiescence(state, -Infinity, Infinity, evalFn);
@@ -490,7 +601,6 @@ export async function pickMove(
     }
     const ret = bestMove ? { from: bestMove[0], to: bestMove[1], score: uiScore } : null;
 
-    // Dataset logging
     const minDepthForLog = (window.chess?.minLoggedDepth ?? 3);
     const loggable = (finishedDepth >= minDepthForLog);
     const logScore = Number.isFinite(bestScore) ? bestScore : uiScore;
@@ -514,7 +624,6 @@ export async function pickMove(
         catch {}
     }
 
-    // Persist to book
     try {
         const fen = toFEN(state);
         const depthStored = finishedDepth || maxDepth;
